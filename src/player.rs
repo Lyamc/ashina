@@ -41,6 +41,7 @@ pub struct Player {
 
     scheduled_events: FuturesUnordered<ScheduledEvent>,
     active_tracks: HashMap<usize, TrackBufferManager>,
+    result_tx: Option<futures::channel::oneshot::Sender<Result<(), Box<dyn std::error::Error>>>>,
 }
 
 impl Player {
@@ -58,13 +59,13 @@ impl Player {
             sndr,
             rcvr,
             media_source,
+            result_tx: None,
         }
     }
 
     pub async fn listen(&mut self, mut cx: Receiver<PlayerState>) -> Result<(), BoxError> {
         loop {
-            tokio::select! {
-                biased;
+            futures::select_biased! {
                 event = cx.next() => {
                     let Some(event) = event else {
                         tracing::info!("Breaking because events dropped.");
@@ -76,12 +77,22 @@ impl Player {
                             self.detach();
                             self.manifest_url = Some(manifest);
                             self.video_id = Some(id);
-                            self.load_manifest().await?;
-                            if let Err(e) = self.attach().await {
-                                tracing::error!(error = ?e, "Got error.");
+                            self.result_tx = tx;
+
+                            if let Err(e) = self.load_manifest().await {
+                                tracing::error!(error = ?e, "Load manifest failed.");
+                                if let Some(tx) = self.result_tx.take() { let _ = tx.send(Err(e)); }
+                            } else if let Err(e) = self.attach().await {
+                                tracing::error!(error = ?e, "Attach failed.");
+                                if let Some(tx) = self.result_tx.take() { let _ = tx.send(Err(e)); }
+                            } else {
+                                // Success
+                                if let Some(tx) = self.result_tx.take() { let _ = tx.send(Ok(())); }
                             }
                         }
-                        _ => {}
+                        PlayerState::Cleanup => {
+                            break;
+                        }
                     }
                 }
                 event = self.rcvr.recv_async() => {
@@ -93,8 +104,10 @@ impl Player {
                     self.process_internal_event(event).await?;
                 }
                 // FIXME: FutUnord when polled empty might return None, which
-                Some(event) = self.scheduled_events.next() => {
-                    self.process_internal_event(event).await?;
+                event = self.scheduled_events.next() => {
+                    if let Some(event) = event {
+                        self.process_internal_event(event).await?;
+                    }
                 }
             }
         }
